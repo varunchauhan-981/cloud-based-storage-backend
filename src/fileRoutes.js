@@ -1,90 +1,302 @@
 const express = require('express');
-const multer = require('multer');
 const router = express.Router();
+const multer = require('multer');
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 const supabase = require('./supabase');
 
-// Multer memory storage configuration (RAM me file hold karega)
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 } // 50MB limit
-});
+// Memory storage for multer
+const upload = multer({ storage: multer.memoryStorage() });
 
-// 1. Get user files
-router.get('/', async (req, res) => {
+// Auth Middleware: Extracts user from Supabase JWT token
+const authenticateUser = async (req, res, next) => {
   try {
-    const { userId, folderId } = req.query;
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ error: 'Missing token' });
+    const token = authHeader.split(' ')[1];
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) return res.status(401).json({ error: 'Unauthorized' });
+    req.user = user;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: 'Authentication failed' });
+  }
+};
 
-    if (!userId) {
-      return res.status(400).json({ error: 'User ID is required' });
-    }
+// ---------------- 1. FILE CRUD ----------------
 
-    let query = supabase
-      .from('files')
-      .select('*')
-      .eq('user_id', userId)
-      .eq('is_trashed', false);
+// Get Files (by folderId, search, type, and sort)
+router.get('/', authenticateUser, async (req, res) => {
+  try {
+    const { folderId, search, type, sortBy = 'name', order = 'asc' } = req.query;
 
-    if (folderId) {
+    let query = supabase.from('files').select('*').eq('user_id', req.user.id);
+
+    if (folderId && folderId !== 'null') {
       query = query.eq('folder_id', folderId);
-    } else {
+    } else if (!search) {
       query = query.is('folder_id', null);
     }
 
-    const { data, error } = await query.order('created_at', { ascending: false });
+    if (search) query = query.ilike('name', `%${search}%`);
+    if (type && type !== 'all') query = query.ilike('mime_type', `%${type}%`);
 
-    if (error) return res.status(400).json({ error: error.message });
+    query = query.order(sortBy, { ascending: order === 'asc' });
+
+    const { data, error } = await query;
+    if (error) throw error;
     res.json(data);
   } catch (err) {
-    res.status(500).json({ error: 'Server error fetching files' });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// 2. Upload file
-router.post('/upload', upload.single('file'), async (req, res) => {
+// Upload File
+router.post('/upload', authenticateUser, upload.single('file'), async (req, res) => {
   try {
-    const file = req.file;
-    const { userId, folderId } = req.body;
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-    if (!file || !userId) {
-      return res.status(400).json({ error: 'File and User ID are required' });
-    }
+    const { folderId } = req.body;
+    const fileExt = req.file.originalname.split('.').pop();
+    const filePath = `${req.user.id}/${Date.now()}-${crypto.randomBytes(4).toString('hex')}.${fileExt}`;
 
-    const filePath = `${userId}/${Date.now()}_${file.originalname}`;
-
-    // Upload to Supabase Storage Bucket
+    // Upload buffer to Supabase 'files' bucket
     const { error: uploadError } = await supabase.storage
-      .from('user-media')
-      .upload(filePath, file.buffer, {
-        contentType: file.mimetype,
+      .from('files')
+      .upload(filePath, req.file.buffer, {
+        contentType: req.file.mimetype,
         upsert: false
       });
 
-    if (uploadError) {
-      return res.status(400).json({ error: uploadError.message });
-    }
+    if (uploadError) throw uploadError;
 
-    // Save record in Files Table
+    // Save file metadata in Database
     const { data, error: dbError } = await supabase
       .from('files')
-      .insert([
-        {
-          name: file.originalname,
-          size_bytes: file.size,
-          mime_type: file.mimetype,
-          storage_path: filePath,
-          folder_id: folderId || null,
-          user_id: userId
-        }
-      ])
+      .insert([{
+        user_id: req.user.id,
+        folder_id: folderId === 'null' || !folderId ? null : folderId,
+        name: req.file.originalname,
+        storage_path: filePath,
+        size: req.file.size,
+        mime_type: req.file.mimetype
+      }])
+      .select()
+      .single();
+
+    if (dbError) throw dbError;
+    res.status(201).json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Download File (Generate Signed URL)
+router.get('/:id/download', authenticateUser, async (req, res) => {
+  try {
+    const { data: file, error } = await supabase
+      .from('files')
+      .select('*')
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.id)
+      .single();
+
+    if (error || !file) return res.status(404).json({ error: 'File not found' });
+
+    const { data: signedData, error: signError } = await supabase.storage
+      .from('files')
+      .createSignedUrl(file.storage_path, 60, {
+        download: file.name
+      });
+
+    if (signError) throw signError;
+    res.json({ downloadUrl: signedData.signedUrl });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Rename File
+router.patch('/:id/rename', authenticateUser, async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name || !name.trim()) return res.status(400).json({ error: 'File name is required' });
+
+    const { data, error } = await supabase
+      .from('files')
+      .update({ name: name.trim(), updated_at: new Date() })
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Move File
+router.patch('/:id/move', authenticateUser, async (req, res) => {
+  try {
+    const { targetFolderId } = req.body;
+    const { data, error } = await supabase
+      .from('files')
+      .update({ 
+        folder_id: targetFolderId === 'null' || !targetFolderId ? null : targetFolderId, 
+        updated_at: new Date() 
+      })
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete File
+router.delete('/:id', authenticateUser, async (req, res) => {
+  try {
+    const { data: file, error: fetchErr } = await supabase
+      .from('files')
+      .select('storage_path')
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.id)
+      .single();
+
+    if (fetchErr || !file) return res.status(404).json({ error: 'File not found' });
+
+    // Remove from storage and DB
+    await supabase.storage.from('files').remove([file.storage_path]);
+    await supabase.from('files').delete().eq('id', req.params.id);
+
+    res.json({ message: 'File deleted successfully' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------- 2. USER SHARING (VIEWER / EDITOR) ----------------
+
+// Share to User Email
+router.post('/:id/share', authenticateUser, async (req, res) => {
+  try {
+    const { email, role } = req.body;
+    if (!email || !email.trim()) return res.status(400).json({ error: 'Email is required' });
+
+    const { data, error } = await supabase
+      .from('file_shares')
+      .upsert({
+        file_id: req.params.id,
+        shared_with_email: email.trim().toLowerCase(),
+        role: role || 'viewer'
+      })
       .select();
 
-    if (dbError) {
-      return res.status(400).json({ error: dbError.message });
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// List Shared Users
+router.get('/:id/shares', authenticateUser, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('file_shares')
+      .select('*')
+      .eq('file_id', req.params.id);
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Revoke Share Access
+router.delete('/shares/:shareId', authenticateUser, async (req, res) => {
+  try {
+    const { error } = await supabase.from('file_shares').delete().eq('id', req.params.shareId);
+    if (error) throw error;
+    res.json({ message: 'Access revoked' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------- 3. PUBLIC LINKS (EXPIRY & PASSWORD) ----------------
+
+// Create Public Link
+router.post('/:id/public-link', authenticateUser, async (req, res) => {
+  try {
+    const { expiresInHours, password } = req.body;
+    const token = crypto.randomBytes(16).toString('hex');
+    let passwordHash = null;
+
+    if (password && password.trim()) {
+      passwordHash = await bcrypt.hash(password.trim(), 10);
     }
 
-    res.status(201).json({ message: 'File uploaded successfully', file: data[0] });
+    const expiresAt = expiresInHours 
+      ? new Date(Date.now() + Number(expiresInHours) * 3600000).toISOString() 
+      : null;
+
+    const { data, error } = await supabase
+      .from('public_links')
+      .insert([{
+        file_id: req.params.id,
+        token,
+        password_hash: passwordHash,
+        expires_at: expiresAt
+      }])
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json({ token: data.token, expires_at: data.expires_at, hasPassword: !!password });
   } catch (err) {
-    res.status(500).json({ error: 'Server error uploading file' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Access Public Link (Public route)
+router.post('/public/access/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+    const { password } = req.body;
+
+    const { data: link, error } = await supabase
+      .from('public_links')
+      .select('*, files(*)')
+      .eq('token', token)
+      .single();
+
+    if (error || !link) return res.status(404).json({ error: 'Link is invalid or expired' });
+
+    if (link.expires_at && new Date() > new Date(link.expires_at)) {
+      return res.status(410).json({ error: 'This link has expired' });
+    }
+
+    if (link.password_hash) {
+      if (!password) return res.status(401).json({ error: 'Password required', passwordRequired: true });
+      const valid = await bcrypt.compare(password, link.password_hash);
+      if (!valid) return res.status(403).json({ error: 'Incorrect password' });
+    }
+
+    const { data: signed } = await supabase.storage
+      .from('files')
+      .createSignedUrl(link.files.storage_path, 120, { download: link.files.name });
+
+    res.json({ file: link.files, downloadUrl: signed.signedUrl });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 

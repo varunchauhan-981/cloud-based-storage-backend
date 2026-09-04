@@ -2,53 +2,81 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('./supabase');
 
-// Sign Up Route
-router.post('/signup', async (req, res) => {
+// 1. User Registration Route
+router.post('/register', async (req, res) => {
   try {
-    const { email, password, fullName } = req.body;
+    const { name, email, password } = req.body;
 
-    const { data, error } = await supabase.auth.signUp({
-      email,
-      password,
+    // Validations
+    if (!name || name.trim().length < 2) {
+      return res.status(400).json({ error: 'Please enter a valid name.' });
+    }
+
+    const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+    if (!email || !emailRegex.test(email.trim())) {
+      return res.status(400).json({ error: 'Please enter a valid email address.' });
+    }
+
+    if (!password || password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters long.' });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+
+    // Supabase Auth Signup
+    const { data: authData, error: authError } = await supabase.auth.signUp({
+      email: cleanEmail,
+      password: password,
       options: {
-        data: { full_name: fullName }
+        data: {
+          full_name: name.trim()
+        }
       }
     });
 
-    if (error) return res.status(400).json({ error: error.message });
-
-    // Profile table me record add karna
-    if (data.user) {
-      await supabase.from('profiles').insert([
-        { id: data.user.id, email, full_name: fullName }
-      ]);
+    if (authError) {
+      return res.status(400).json({ error: authError.message });
     }
 
-    res.status(201).json({ message: 'User registered successfully', user: data.user });
+    res.status(201).json({
+      message: 'Account created successfully! Please sign in.',
+      token: authData.session?.access_token || null,
+      user: authData.user
+    });
   } catch (err) {
-    res.status(500).json({ error: 'Server error during signup' });
+    console.error('Registration error details:', err.message || err);
+    res.status(500).json({ error: err.message || 'Internal server error during registration' });
   }
 });
 
-// Login Route
+// 2. User Login Route
 router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
 
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required.' });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+
     const { data, error } = await supabase.auth.signInWithPassword({
-      email,
-      password
+      email: cleanEmail,
+      password: password
     });
 
-    if (error) return res.status(400).json({ error: error.message });
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
 
     res.json({
       message: 'Login successful',
-      token: data.session?.access_token,
+      token: data.session.access_token,
       user: data.user
     });
   } catch (err) {
-    res.status(500).json({ error: 'Server error during login' });
+    console.error('Login error details:', err.message || err);
+    res.status(500).json({ error: 'Internal server error during login' });
   }
 });
 
