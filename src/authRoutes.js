@@ -1,6 +1,13 @@
 const express = require('express');
 const router = express.Router();
 const supabase = require('./supabase');
+const { createClient } = require('@supabase/supabase-js');
+
+// Admin client using Service Role Key to bypass email verification limits
+const supabaseAdmin = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY
+);
 
 // 1. User Registration Route
 router.post('/register', async (req, res) => {
@@ -23,14 +30,13 @@ router.post('/register', async (req, res) => {
 
     const cleanEmail = email.trim().toLowerCase();
 
-    // Supabase Auth Signup
-    const { data: authData, error: authError } = await supabase.auth.signUp({
+    // Admin Create User: Directly creates verified user without triggering confirmation emails
+    const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
       email: cleanEmail,
       password: password,
-      options: {
-        data: {
-          full_name: name.trim()
-        }
+      email_confirm: true,
+      user_metadata: {
+        full_name: name.trim()
       }
     });
 
@@ -40,7 +46,7 @@ router.post('/register', async (req, res) => {
 
     res.status(201).json({
       message: 'Account created successfully! Please sign in.',
-      token: authData.session?.access_token || null,
+      token: null,
       user: authData.user
     });
   } catch (err) {
