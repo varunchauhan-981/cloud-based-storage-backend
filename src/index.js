@@ -12,11 +12,13 @@ app.use(express.json());
 const authRoutes = require('./authRoutes');
 const folderRoutes = require('./folderRoutes');
 const fileRoutes = require('./fileRoutes');
+const shareRoutes = require('./shareRoutes');
 
 // Mount Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/folders', folderRoutes);
 app.use('/api/files', fileRoutes);
+app.use('/api/shares', shareRoutes);
 
 // Health Check Route
 app.get('/api/health', (req, res) => {
